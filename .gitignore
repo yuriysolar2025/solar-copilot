@@ -1,0 +1,5 @@
+.build/
+SolarCopilot.app/
+*.swiftpm
+.DS_Store
+Package.resolved
