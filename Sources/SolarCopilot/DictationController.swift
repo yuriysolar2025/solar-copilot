@@ -15,16 +15,19 @@ final class DictationController {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var clip: ClipRecorder?
+    private var watchdog: Timer?
 
     private enum Mode { case idle, recordingNormal, recordingToggle, stopping, ignoreRelease }
     private var mode: Mode = .idle
-    private var pressTime: CFTimeInterval = 0
+    private var pressEventTS: CGEventTimestamp = 0
     private var rightCmdHeld = false
 
     private let tapThreshold = 0.4
     private let rightCmdKeycode: Int64 = 54
 
     var onStatus: ((String) -> Void)?
+    /// Старт/стоп записи диктовки наружу (AppDelegate → глаз компаньона: красный + «Диктуй»).
+    var onRecording: ((Bool) -> Void)?
 
     init(cfg: AppConfig) { self.cfg = cfg }
 
@@ -86,10 +89,27 @@ final class DictationController {
         runLoopSource = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
+        startWatchdog()
         return true
     }
 
+    /// macOS вырубает CGEventTap по таймауту, если колбэк подвисает (синхронный
+    /// engine.start() ~1-2с на старте записи блокирует main). Re-enable в самом колбэке
+    /// не всегда срабатывает (отключённый tap может не доставить событие). Сторож раз в
+    /// 2с проверяет и оживляет tap → правый Cmd не «умирает» после нескольких диктовок.
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self, let t = self.tap else { return }
+            if !CGEvent.tapIsEnabled(tap: t) {
+                CGEvent.tapEnable(tap: t, enable: true)
+                Self.logf("watchdog: tap был отключён → re-enabled")
+            }
+        }
+    }
+
     func stop() {
+        watchdog?.invalidate(); watchdog = nil
         if let src = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
         if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
         runLoopSource = nil
@@ -109,15 +129,15 @@ final class DictationController {
         }
         guard event.getIntegerValueField(.keyboardEventKeycode) == rightCmdKeycode else { return }
         let cmdNow = event.flags.contains(.maskCommand)
-        if cmdNow && !rightCmdHeld { rightCmdHeld = true; Self.logf("rightCmd PRESS"); onPress() }
-        else if !cmdNow && rightCmdHeld { rightCmdHeld = false; Self.logf("rightCmd RELEASE mode=\(mode)"); onRelease() }
+        let ts = event.timestamp
+        if cmdNow && !rightCmdHeld { rightCmdHeld = true; Self.logf("rightCmd PRESS"); onPress(ts) }
+        else if !cmdNow && rightCmdHeld { rightCmdHeld = false; Self.logf("rightCmd RELEASE mode=\(mode)"); onRelease(ts) }
     }
 
-    private func onPress() {
-        let now = CACurrentMediaTime()
+    private func onPress(_ ts: CGEventTimestamp) {
         switch mode {
         case .idle:
-            startRecording(); pressTime = now; mode = .recordingNormal
+            pressEventTS = ts; startRecording(); mode = .recordingNormal
         case .recordingToggle:
             mode = .stopping; stopAndProcess(); mode = .ignoreRelease
         default:
@@ -125,10 +145,13 @@ final class DictationController {
         }
     }
 
-    private func onRelease() {
+    private func onRelease(_ ts: CGEventTimestamp) {
         switch mode {
         case .recordingNormal:
-            let dur = CACurrentMediaTime() - pressTime
+            // длительность по таймстампам СОБЫТИЙ (не по часам обработчика): синхронный
+            // старт движка может на ~2с заблокировать main и задержать обработку release —
+            // иначе быстрый тап прочитался бы как удержание. CGEvent.timestamp — в НАНОсекундах.
+            let dur = Double(ts &- pressEventTS) / 1_000_000_000.0
             if dur < tapThreshold {
                 mode = .recordingToggle            // тап → продолжаем писать, ждём второй тап
             } else {
@@ -145,14 +168,15 @@ final class DictationController {
 
     private func startRecording() {
         let c = ClipRecorder()
+        onRecording?(true)            // глаз красный — намерение (до возможного прогрева движка)
         if c.start() {
             clip = c
-            playSound("Tink")
-            showIndicator()
+            playSound("Tink")         // звучит, когда движок реально готов = сигнал «говори»
             Self.logf("recording STARTED")
         } else {
             clip = nil
             mode = .idle
+            onRecording?(false)
             Self.logf("recording FAILED — микрофон недоступен")
             onStatus?("🎙 Диктовка: микрофон недоступен")
         }
@@ -163,7 +187,7 @@ final class DictationController {
         clip = nil
         mode = .stopping
         playSound("Blow")
-        hideIndicator()
+        onRecording?(false)              // глаз компаньона → обычный (или таймер звонка, если идёт)
         c.stop { [weak self] url in
             guard let self = self else { return }
             guard let url = url else { self.mode = .idle; Self.logf("stop: wav пуст/коротко → пропуск"); return }
@@ -176,8 +200,20 @@ final class DictationController {
         }
     }
 
-    /// `dictate-pipeline <wav>` → текст на stdout (whisper + фильтр галлюцинаций внутри).
+    /// wav → текст. У Юрия есть личный `~/bin/dictate-pipeline` (whisper + polish) —
+    /// используем его. У друга его НЕТ → встроенный путь: тот же whisper-server :8127,
+    /// что и копилот (через `WhisperServerProvider`) + фильтр галлюцинаций. Так диктовка
+    /// работает у друга без внешнего скрипта.
     private func runPipeline(_ wav: URL, _ done: @escaping (String?) -> Void) {
+        if FileManager.default.isExecutableFile(atPath: cfg.dictatePipelinePath) {
+            runExternalPipeline(wav, done)
+        } else {
+            runBuiltinPipeline(wav, done)
+        }
+    }
+
+    /// Личный путь Юрия — `~/bin/dictate-pipeline <wav>` → текст на stdout.
+    private func runExternalPipeline(_ wav: URL, _ done: @escaping (String?) -> Void) {
         let bin = cfg.dictatePipelinePath
         DispatchQueue.global().async {
             let p = Process()
@@ -198,14 +234,39 @@ final class DictationController {
         }
     }
 
-    /// Вставка в активное окно: кладём в буфер, шлём Cmd+V, восстанавливаем буфер.
-    private func paste(_ text: String) {
-        let pb = NSPasteboard.general
-        let saved = pb.string(forType: .string)
-        pb.clearContents()
-        pb.setString(text, forType: .string)
+    /// Встроенный путь (для друга): wav → whisper-server :8127 → фильтр галлюцинаций.
+    private func runBuiltinPipeline(_ wav: URL, _ done: @escaping (String?) -> Void) {
+        guard let data = try? Data(contentsOf: wav) else { done(nil); return }
+        let provider = WhisperServerProvider(url: cfg.whisperURL, language: cfg.language)
+        Task {
+            do {
+                let text = try await provider.transcribe(wav: data)
+                let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let result = (clean.isEmpty || TextFilter.isHallucination(clean)) ? nil : clean
+                await MainActor.run { done(result) }
+            } catch {
+                Self.logf("builtin pipeline: whisper ошибка — \(error.localizedDescription)")
+                await MainActor.run { done(nil) }
+            }
+        }
+    }
 
-        Self.logf("paste: AX=\(Self.accessibilityTrusted() ? "выдан" : "НЕТ"), шлю Cmd+V (\(text.count) chars)")
+    /// Вставка в активное окно: сначала сохраняем расшифровку на диск, затем кладём
+    /// её в буфер и шлём Cmd+V. Буфер намеренно НЕ восстанавливаем: некоторые
+    /// приложения читают pasteboard асинхронно и при прежнем restore через 0.35с
+    /// вставляли старый текст. Последняя диктовка остаётся в clipboard как fallback.
+    private func paste(_ text: String) {
+        saveLastTranscription(text)
+
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard pb.setString(text, forType: .string), pb.string(forType: .string) == text else {
+            Self.logf("paste: не удалось записать расшифровку в clipboard; текст сохранён в last-dictation.txt")
+            onStatus?("🎙 Диктовка сохранена, но буфер обмена недоступен")
+            return
+        }
+
+        Self.logf("paste: AX=\(Self.accessibilityTrusted() ? "выдан" : "НЕТ"), clipboard verified, шлю Cmd+V (\(text.count) chars); clipboard оставлен с расшифровкой")
         let src = CGEventSource(stateID: .combinedSessionState)
         let vKey: CGKeyCode = 9   // kVK_ANSI_V
         if let down = CGEvent(keyboardEventSource: src, virtualKey: vKey, keyDown: true) {
@@ -216,34 +277,25 @@ final class DictationController {
             up.flags = .maskCommand
             up.post(tap: .cghidEventTap)
         }
-        if let saved = saved {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                pb.clearContents()
-                pb.setString(saved, forType: .string)
-            }
+    }
+
+    /// Durable fallback для случаев, когда фокус окна сменился или приложение не
+    /// приняло синтетический Cmd+V. Файл всегда содержит последнюю успешную диктовку.
+    private func saveLastTranscription(_ text: String) {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SolarCopilot", isDirectory: true)
+        let url = dir.appendingPathComponent("last-dictation.txt")
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            Self.logf("saved fallback: \(url.path) (\(text.count) chars)")
+        } catch {
+            Self.logf("saved fallback FAILED: \(error.localizedDescription)")
         }
     }
 
     // MARK: - Feedback
 
     private func playSound(_ name: String) { NSSound(named: NSSound.Name(name))?.play() }
-
-    private let tnGroup = "solar-dictation"
-    private var tnBin: String { "/opt/homebrew/bin/terminal-notifier" }
-
-    /// Системное NC-уведомление пробивает fullscreen (как в dictation.lua).
-    private func showIndicator() {
-        runTN(["-remove", tnGroup])
-        runTN(["-title", "🎙 Диктовка", "-message", "Идёт запись (Right Cmd → стоп)",
-               "-group", tnGroup, "-ignoreDnD", "-sound", ""])
-    }
-    private func hideIndicator() { runTN(["-remove", tnGroup]) }
-
-    private func runTN(_ args: [String]) {
-        guard FileManager.default.isExecutableFile(atPath: tnBin) else { return }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: tnBin)
-        p.arguments = args
-        try? p.run()
-    }
 }

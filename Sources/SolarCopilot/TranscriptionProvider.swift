@@ -2,7 +2,7 @@ import Foundation
 
 /// Бэкенд транскрипции за протоколом (product-ready guardrail: whisper-server
 /// сейчас, позже можно встроенный whisper.cpp или облако — без рерайта).
-protocol TranscriptionProvider {
+protocol TranscriptionProvider: Sendable {
     func transcribe(wav: Data) async throws -> String
 }
 

@@ -23,6 +23,12 @@ final class CopilotBrain {
     private var busy = false
     private var timer: Timer?
 
+    // Зрение по экрану (vision): кадр главного дисплея уходит в Claude вместе с
+    // транскриптом. Гибрид — авто-таймер + кнопка «глянь сейчас».
+    private var screenVision: Bool
+    private var lastShot: URL?
+    private var screenTimer: Timer?
+
     /// Новая строка ассистента (подсказка/заметка) — на main.
     var onAssistant: ((String) -> Void)?
     /// Статус/служебное (смена режима, ошибки) — на main.
@@ -40,6 +46,7 @@ final class CopilotBrain {
     init(llm: LLMProvider, cfg: AppConfig) {
         self.llm = llm
         self.cfg = cfg
+        self.screenVision = cfg.screenVisionEnabled
     }
 
     // MARK: - Жизненный цикл
@@ -52,8 +59,9 @@ final class CopilotBrain {
             Task { @MainActor in self?.tick() }
         }
         timer = t
+        startScreenCapture()
         if !FileManager.default.fileExists(atPath: resourcesDir.appendingPathComponent("persona.md").path) {
-            onStatus?("⚠️ persona.md не найден в \(resourcesDir.path) — подсказки будут общими. Поправь путь в настройках.")
+            onStatus?("ℹ️ Использую дефолтный профиль подсказок. Свой persona.md положи в \(resourcesDir.path) — и копилот зазвучит твоим голосом.")
         }
     }
 
@@ -61,6 +69,67 @@ final class CopilotBrain {
         running = false
         timer?.invalidate()
         timer = nil
+        screenTimer?.invalidate()
+        screenTimer = nil
+        lastShot = nil
+    }
+
+    // MARK: - Зрение по экрану
+
+    /// Авто-захват кадра по таймеру (реже подсказок). Кадр приложится к следующей
+    /// подсказке. Нет доступа к записи экрана → мягко подсказываем выдать.
+    private func startScreenCapture() {
+        guard screenVision else { return }
+        guard ScreenCapturer.hasPermission() else {
+            onStatus?("👁 Чтобы копилот видел экран — выдай «Запись экрана» (меню → 👁 Глянь на экран).")
+            return
+        }
+        captureFrame()
+        let iv = max(20.0, cfg.screenCaptureIntervalSec)
+        screenTimer?.invalidate()
+        screenTimer = Timer.scheduledTimer(withTimeInterval: iv, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.captureFrame() }
+        }
+    }
+
+    private func captureFrame() {
+        if let url = ScreenCapturer.capture() { lastShot = url }
+    }
+
+    /// Путь к свежему кадру для приложения к подсказке (если зрение вкл и файл есть).
+    private func currentScreenshotPath() -> String? {
+        guard screenVision, let u = lastShot, FileManager.default.fileExists(atPath: u.path) else { return nil }
+        return u.path
+    }
+
+    /// Кнопка «глянь на экран сейчас» — мгновенный кадр + подсказка по нему,
+    /// даже если транскрипт пока тонкий.
+    func captureNow() {
+        guard ScreenCapturer.hasPermission() else {
+            ScreenCapturer.requestPermission()
+            onStatus?("👁 Запросил доступ к экрану. Выдай «Запись экрана» в Системных настройках и нажми ещё раз.")
+            return
+        }
+        screenVision = true
+        captureFrame()
+        onStatus?("👁 Смотрю на экран…")
+        guard running, !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false }
+            do { emit(try await makeSuggestion()) }
+            catch { onStatus?("⚠️ Ассистент: \(error.localizedDescription)") }
+        }
+    }
+
+    /// Тумблер зрения из меню по ходу сессии.
+    func setScreenVision(enabled: Bool) {
+        screenVision = enabled
+        if enabled { startScreenCapture() }
+        else {
+            screenTimer?.invalidate(); screenTimer = nil; lastShot = nil
+            onStatus?("👁 Зрение по экрану выключено.")
+        }
     }
 
     // MARK: - Вход от Юрия (контекст / заметки / смена режима)
@@ -116,6 +185,13 @@ final class CopilotBrain {
     private func emit(_ raw: String) {
         let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !["skip", "пропустить"].contains(clean.lowercased()) else { return }
+        // Не выпускать в подсказки утечку ошибок claude -p (auth/401/billing в stdout).
+        let low = clean.lowercased()
+        if low.contains("authenticate") || low.contains("api error") || low.contains("401 ")
+            || low.contains("organization has disabled") || low.contains("invalid api key") {
+            onStatus?("⚠️ Claude не ответил (auth) — подсказка пропущена.")
+            return
+        }
         suggestions.append(clean)
         onAssistant?(clean)
     }
@@ -161,8 +237,21 @@ final class CopilotBrain {
 
     // MARK: - Файлы-ресурсы
 
+    /// Ресурс копилота: сначала личный файл пользователя (resourcesDir, приоритет),
+    /// иначе дефолтный шаблон из бандла (`copilot-templates/` — чтобы у друга подсказки
+    /// работали без личной персоны Юрия).
     private func resource(_ name: String) -> String {
-        (try? String(contentsOf: resourcesDir.appendingPathComponent(name), encoding: .utf8)) ?? ""
+        let userFile = resourcesDir.appendingPathComponent(name)
+        if let s = try? String(contentsOf: userFile, encoding: .utf8),
+           !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return s
+        }
+        if let res = Bundle.main.resourcePath {
+            let tmpl = URL(fileURLWithPath: res)
+                .appendingPathComponent("copilot-templates").appendingPathComponent(name)
+            if let s = try? String(contentsOf: tmpl, encoding: .utf8) { return s }
+        }
+        return ""
     }
 
     private var transcriptTail: String { transcript.suffix(30).joined(separator: "\n") }
@@ -174,43 +263,68 @@ final class CopilotBrain {
     private func makeSuggestion() async throws -> String {
         let persona = resource("persona.md")
         let checklist = resource("checklist.json")
+        let examples = resource("hint_examples.md")
         let prompt = """
-        Ты — копилот Юрия Солара на текущем звонке. Дай ОДНУ конкретную подсказку (≤15 слов) ИЛИ ответь словом "skip".
+        Ты — копилот Юрия Солара на живом звонке. Юрий ВЕДЁТ разговор и краем глаза
+        ловит твою подсказку. Нужна не вопрос-напоминалка, а готовый тактический ход:
+        что сказать ПРЯМО СЕЙЧАС и как подать, чтобы продвинуть сделку.
+
+        Верни ОДНУ подсказку по форме ниже ИЛИ ровно слово "skip", если момент не созрел.
 
         КОНТЕКСТ ЗВОНКА (от Юрия): \(callContext.ifEmpty("не указан"))
 
-        ЗАМЕТКИ ОТ ЮРИЯ В ПРОЦЕССЕ (то что он реально знает / решил):
+        ЗАМЕТКИ ЮРИЯ В ПРОЦЕССЕ (что он уже знает / решил — не противоречь):
         \(notesText)
 
-        ПЕРСОНА ЮРИЯ И ЕГО СТИЛЬ:
+        ПЕРСОНА, СТИЛЬ И ПРИЁМЫ ЮРИЯ (формулируй его голосом; бери его обработку возражений и pricing-ходы):
         \(persona)
 
-        ЧЕК-ЛИСТ ИДЕАЛЬНОГО ЗВОНКА (включая «часто забывает»):
+        ЧЕК-ЛИСТ ИДЕАЛЬНОГО ЗВОНКА (важное, что часто забывает спросить):
         \(checklist)
 
-        ПРЕДЫДУЩИЕ ПОДСКАЗКИ (не повторять дословно):
+        ЭТАЛОННЫЕ ПОДСКАЗКИ — вот такой глубины и пользы ждут от тебя (копируй СТИЛЬ и СТРУКТУРУ, не содержание):
+        \(examples.ifEmpty("(файл примеров не найден — держи планку: готовая реплика голосом Юрия + одна строка рамки)"))
+
+        ПРЕДЫДУЩИЕ ПОДСКАЗКИ (не повторять):
         \(prevSug)
 
-        ТРАНСКРИПТ ПОСЛЕДНИХ 30 РЕПЛИК:
+        ТРАНСКРИПТ ПОСЛЕДНИХ РЕПЛИК:
         \(transcriptTail)
 
-        Задача: что Юрию стоит ПРЯМО СЕЙЧАС спросить или уточнить?
-        Правила:
-        - Учитывай заметки Юрия: если он уже сказал «у них своя CRM» — про CRM не спрашивай
-        - Учитывай фазу звонка по транскрипту (знакомство/копаем боль/квалификация/закрытие)
-        - Приоритет — пункты `often_skipped=true` если они релевантны фазе
-        - Не повторяй прошлые подсказки дословно, но можно вернуться к теме если разговор подошёл
+        КОГДА ПОДСКАЗЫВАТЬ (приоритет сверху вниз):
+        1. Клиент возразил/засомневался (дорого / справлюсь ли / случай сложный / вдруг отвалишься) → готовая реплика снятия по приёмам Юрия из персоны.
+        2. Клиент боится денег/стоимости → разверни в конкретику: из чего реально складывается, почему это копейки, якорь на одну сделку / ROI.
+        3. Зашёл разговор о цене → фазовая подача (вход дёшево, окупается с первой продажи, дальше по факту) + якорь «студия взяла бы в разы дороже». Полную сумму не называй первой.
+        4. Клиент описал боль/идею своими словами → свяжи его формулировку с твоим решением его же терминами («то, что ты называешь X — это и есть Y, мы это и строим»).
+        5. Клиент перегружен/путается → упрости до одного следующего шага.
+        6. Момент закрытия → зафиксируй конкретный next step (доступ к данным/коду, дата созвона, кто что готовит).
+        7. Если живого нет, но по фазе повис важный незаданный вопрос из чек-листа (бюджет/срок/ЛПР/критерий успеха) → подскажи его задать.
 
-        Если уместной подсказки нет — "skip".
-
-        ПРАВИЛА ФОРМЫ:
-        - ОДНА короткая строка вопросом или императивом, как живой коуч сказал бы рядом
-        - ТОЛЬКО на естественном русском, как живой человек
-        - НИКАКИХ snake_case тегов из чек-листа (типа `team_size`, `often_skipped`, `pain_discovery`)
-        - Без преамбулы, без эмодзи, без markdown
+        ФОРМА ОТВЕТА:
+        - Начни с готовой реплики, которую Юрий может почти дословно произнести — в кавычках, его голосом.
+        - Если нужно — добавь ОДНУ короткую строку рамки (как подать / чего избежать). Без неё, если реплика самодостаточна.
+        - 1–6 строк, плотно, без воды. Без преамбулы, без markdown-заголовков, без объяснений что это подсказка.
+        - Живой естественный русский. Никаких snake_case тегов из чек-листа (team_size, often_skipped, pain_discovery).
+        - Не выдумывай фактов, которых нет в транскрипте/заметках/контексте — цифры и имена бери из разговора.
+        - Если по-настоящему нечего добавить прямо сейчас — верни одно слово: skip
         """
-        let out = try await llm.complete(prompt: prompt, model: cfg.suggestModel, timeout: 60)
-        return out.isEmpty ? "skip" : "💡 \(out)"
+        let shot = currentScreenshotPath()
+        let out: String
+        if let shot = shot {
+            let visionPrompt = prompt + """
+
+
+            НА ЭКРАНЕ СЕЙЧАС: тебе приложен скриншот экрана Юрия (демо/код/сайт/таблица клиента). \
+            Открой его и учитывай, что на нём — но только если это релевантно текущему моменту разговора. \
+            Если на экране есть конкретика (цифры, поля, ошибки, цена) — опирайся на неё в подсказке.
+            """
+            out = try await llm.complete(prompt: visionPrompt, imagePaths: [shot], model: cfg.suggestModel, timeout: 120)
+        } else {
+            out = try await llm.complete(prompt: prompt, model: cfg.suggestModel, timeout: 90)
+        }
+        let clean = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.isEmpty || ["skip", "пропустить"].contains(clean.lowercased()) { return "skip" }
+        return "💡 \(clean)"
     }
 
     // MARK: - Заметка (listen)
@@ -311,6 +425,7 @@ final class CopilotBrain {
         - НИКАКИХ snake_case, backticks, скобок с тегами, метаданных
         - Не пиши «пункт N чек-листа» — просто описывай суть человеческими словами
         - Не пиши «discovery/pain_discovery/qualification фаза» — пиши «знакомство», «копаем боль», «квалификация»
+        - Никогда не включай в сводку пароли, коды доступа, токены, API-ключи и другие секреты, даже если они прозвучали в звонке
         - Без преамбулы, без markdown code-fence
         """
         return try await llm.complete(prompt: prompt, model: cfg.summaryModel, timeout: 300)

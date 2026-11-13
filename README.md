@@ -1,45 +1,63 @@
-# Solar Copilot — нативное приложение (Phase 1)
+# Solar Copilot
 
-Нативный macOS menubar-копилот. Замена хрупкому MVP (Hammerspoon + Terminal + tmux + Telegram-топики). План и фазы: [`Архитектура/tasks/⬜ copilot-native-app/`](../../Архитектура/tasks/⬜%20copilot-native-app/README.md).
+Голосовой помощник для Mac, который живёт в меню-баре и закрывает три вещи:
 
-## Что уже есть (Phase 1)
+- **Копилот на созвонах.** Пишет звонок, показывает живую расшифровку, по ходу подсказывает готовые реплики (не «спроси про бюджет», а что сказать прямо сейчас), в конце выдаёт сводку: договорённости, обещания, следующие шаги.
+- **Диктовка голосом.** Зажал правый Cmd, сказал, отпустил, текст вставился в активное окно. Работает в любом приложении.
+- **Переключатель раскладки.** Набрал `ghbdtn` вместо «привет», тапнул левый Option, слово исправлено и раскладка переключена. Замена Punto Switcher.
 
-- Меню-бар (🎙/🔴) со Старт/Стоп, «Показать транскрипт», Выход.
-- Нативный доступ к микрофону (AVAudioEngine, без Terminal-хака).
-- Аудио → ресемпл в 16kHz mono → WAV → локальный whisper-server `:8127` (тот же бэкенд, что MVP).
-- Живой транскрипт в нативном окне (вместо Telegram-топиков).
+Расшифровка идёт локально на вашем Mac (whisper.cpp), звук никуда не отправляется.
+Подсказки и сводки делает Claude по **вашей** подписке Claude Pro или Max через Claude Code. Серверов и регистрации нет.
 
-## Сборка и запуск
+## Что нужно
 
-```sh
-cd "copilot/native-app"
-./build.sh          # swift build + упаковка в SolarCopilot.app + ad-hoc подпись
-open SolarCopilot.app
+- Mac на Apple Silicon (M1 и новее), macOS 13+.
+- Подписка Claude Pro или Max и установленный Claude Code (`claude login`).
+- whisper.cpp: `brew install whisper-cpp`. Модель распознавания (~1,6 ГБ) приложение скачает само.
+
+## Установка за 10 минут
+
+Пошагово в [INSTALL.md](INSTALL.md). Коротко:
+
+1. Скачайте `SolarCopilot-<версия>.zip` из [Releases](../../releases), распакуйте, перенесите `SolarCopilot.app` в «Программы».
+2. Приложение подписано без сертификата Apple, поэтому один раз снимите карантин:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/SolarCopilot.app
+   ```
+3. Запустите. В меню-баре появится 🎙. Откройте «⚙ Готовность копилота…», оно покажет, чего не хватает: Claude Code, whisper, модель, разрешения.
+
+## Как пользоваться
+
+- **Созвон:** кнопка на плавающей панели или «Старт» в меню. Транскрипт и подсказки в окне, по «Стоп» сводка. Записи лежат в `~/Library/Application Support/SolarCopilot/recordings`.
+- **Диктовка:** правый Cmd. При первом разе приложение попросит «Мониторинг ввода» и «Универсальный доступ».
+- **Раскладка:** левый Option. Работает сразу после установки, без Claude и whisper.
+
+Чтобы подсказки звучали вашим голосом и под ваш продукт, положите свои `persona.md`, `checklist.json` и `hint_examples.md` в `~/Library/Application Support/SolarCopilot/`. Образцы лежат в `Resources/copilot-templates/`.
+
+## Настройки
+
+Окно «Настройки…» в меню или через `defaults`:
+
+```bash
+defaults write com.solar.copilot language "ru"
+defaults write com.solar.copilot chunkSeconds 20
+defaults write com.solar.copilot suggestionIntervalSec 45
+defaults write com.solar.copilot llmProviderMode claude     # claude | codex | auto
 ```
 
-Требования: Swift toolchain (Command Line Tools достаточно, полный Xcode не нужен), запущенный whisper-server на `127.0.0.1:8127` (как у MVP).
+Логи: `~/Library/Logs/solar-copilot*.log`.
 
-При первом запуске Старт → macOS спросит доступ к микрофону → разрешить (Системные настройки → Конфиденциальность → Микрофон).
+## Сборка из исходников
 
-## Настройки (без хардкод-секретов)
+Нужен только Swift toolchain из Command Line Tools (`xcode-select --install`):
 
-Через `defaults`:
-```sh
-defaults write com.solar.copilot whisperURL  "http://127.0.0.1:8127/inference"
-defaults write com.solar.copilot chunkSeconds 20      # длина чанка, сек (20 дефолт; 30 = качество large-v3)
-defaults write com.solar.copilot language     "ru"
+```bash
+./build.sh --release-zip     # dist/SolarCopilot-<версия>-arm64.zip
+./build.sh                   # собрать и поставить в /Applications
 ```
 
-## Архитектура (product-ready guardrails заложены)
+Подробнее об архитектуре в [DEVELOPMENT.md](DEVELOPMENT.md).
 
-- `TranscriptionProvider` (протокол) → `WhisperServerProvider` — бэкенд транскрипции подменяем.
-- `LLMProvider` (протокол, Phase 2) — LLM за абстракцией: личный аккаунт → BYO-key / прокси без рерайта.
-- `AppConfig` — всё из UserDefaults, ноль секретов в коде.
-- `L` (Strings) — готовность к локализации RU/EN.
-- Сборка как подписанный `.app` с первого дня.
+## Лицензия
 
-## Дальше (фазы)
-
-- **Phase 2:** Opus-подсказки по ходу + финальная сводка нативно (порт промптов/персоны из `daemon.py`).
-- **Phase 3:** режим наушники+BlackHole, drive/listen авто-детект, выбор устройства.
-- **Phase 4:** история сессий, настройки-UI, Developer ID + нотаризация + DMG.
+MIT.

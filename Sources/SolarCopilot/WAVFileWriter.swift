@@ -32,6 +32,24 @@ final class WAVFileWriter {
         try? handle.close()
     }
 
+    /// Чинит placeholder-заголовок orphan WAV после crash по фактическому размеру файла.
+    static func repairHeader(at url: URL) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber, size.intValue >= 44,
+              let handle = try? FileHandle(forWritingTo: url) else { return false }
+        defer { try? handle.close() }
+        let dataBytes = size.intValue - 44
+        var riff = UInt32(36 + dataBytes).littleEndian
+        var dataSz = UInt32(dataBytes).littleEndian
+        do {
+            try handle.seek(toOffset: 4)
+            try withUnsafeBytes(of: &riff) { try handle.write(contentsOf: Data($0)) }
+            try handle.seek(toOffset: 40)
+            try withUnsafeBytes(of: &dataSz) { try handle.write(contentsOf: Data($0)) }
+            return true
+        } catch { return false }
+    }
+
     static func header(dataSize: Int, sampleRate: Int) -> Data {
         var d = Data()
         let byteRate = sampleRate * 2

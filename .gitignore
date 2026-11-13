@@ -1,5 +1,7 @@
 .build/
 SolarCopilot.app/
+SolarCopilot *.app/
+dist/
 *.swiftpm
 .DS_Store
 Package.resolved

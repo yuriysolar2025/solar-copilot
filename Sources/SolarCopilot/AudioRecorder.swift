@@ -4,8 +4,18 @@ import CoreAudio
 import AudioToolbox
 
 /// Захват микрофона через AVAudioEngine, ресемпл в 16kHz mono Int16.
-/// Одной сессией ДЕЛАЕТ ОБА: (1) пишет аудио, на «Стоп» конвертит в `audio.m4a`
-/// (AAC — открывается на Mac везде, ~10× меньше WAV), (2) шлёт чанки в whisper.
+/// Одной сессией ДЕЛАЕТ ОБА: (1) пишет аудио в ЛОКАЛЬНЫЙ wav (/tmp), на «Стоп»
+/// конвертит в `audio.m4a` и кладёт в `sessionDir`; (2) шлёт чанки в whisper.
+///
+/// Надёжность (фикс 2026-06-19 «копилот постоянно отваливается»):
+/// - Подписка на `AVAudioEngineConfigurationChange` + watchdog ПЕРЕЗАПУСКАЮТ движок,
+///   когда меняется аудиомаршрут (воткнул наушники / созвон захватил микрофон /
+///   сменился дефолтный вход). Без этого AVAudioEngine штатно встаёт и не оживает —
+///   запись молча умирает, а апп думает что пишет.
+/// - Рабочий wav пишется в /tmp, НЕ в iCloud: iCloud Drive лочит файл на фоновой
+///   синхронизации и дропает сэмплы (огрызок аудио + галлюцинация whisper, баг 02.06).
+/// - Файловый лог `~/Library/Logs/solar-copilot.log` — апп не пишет в unified log,
+///   при отвале раньше не было ни одного следа.
 final class AudioRecorder {
     private let engine = AVAudioEngine()
     private var converter: AVAudioConverter?
@@ -14,25 +24,86 @@ final class AudioRecorder {
     private var sampleBuffer = [Int16]()
     private let lock = NSLock()
     private let chunkSamples: Int
+    private let chunkSeconds: Double
     private let provider: TranscriptionProvider
-    private let sessionDir: URL
+    private let sessionDir: URL              // финальный архив (может быть в iCloud)
+    private let workWavURL: URL              // рабочий wav — ВСЕГДА локально (/tmp)
     private let inputDevicePrefs: [String]   // Phase 4: RecordCall = обе стороны звонка
     private var running = false
 
     private let ioQueue = DispatchQueue(label: "com.solar.copilot.wavio")
     private var fileWriter: WAVFileWriter?
 
-    var onTranscript: ((String) -> Void)?
+    // Надёжность движка
+    private var configObserver: NSObjectProtocol?
+    private var watchdog: Timer?
+    private var bufferTotal = 0              // под lock: сколько буферов всего пришло
+    private var watchdogPrev = 0            // снимок bufferTotal на прошлом тике
+    private var restarting = false
+
+    var onTranscript: ((Int, String) -> Void)?
+    /// Фатальная ошибка захвата/файла: запись действительно не может продолжаться.
     var onError: ((String) -> Void)?
+    /// Мягкая ошибка распознавания: локальная аудиозапись НЕ останавливается.
+    var onTranscriptionError: ((Int, String) -> Void)?
+    /// Следующий успешный чанк после деградации — UI может снять предупреждение.
+    var onTranscriptionRecovered: (() -> Void)?
+    /// Мягкое уведомление (переподключение устройства) — НЕ останавливает запись.
+    var onNotice: ((String) -> Void)?
     /// URL итогового аудио (m4a) по завершении, на main.
     var onSaved: ((URL) -> Void)?
 
+    private lazy var transcriptionPipeline = TranscriptionPipeline(
+        provider: provider,
+        recoveryDir: sessionDir.appendingPathComponent("failed-chunks", isDirectory: true),
+        onTranscript: { [weak self] sequence, clean in
+            guard let self = self else { return }
+            self.onTranscript?(sequence, clean)
+            self.onTranscriptionRecovered?()
+            Self.log("STT chunk=\(sequence) committed in audio order")
+        },
+        onError: { [weak self] sequence, message in
+            guard let self = self else { return }
+            Self.log("STT chunk=\(sequence) unavailable after retries: \(message)")
+            self.onTranscriptionError?(sequence, "Whisper: \(message)")
+        },
+        onRecovered: { [weak self] in
+            self?.onTranscriptionRecovered?()
+        }
+    )
+
     init(chunkSeconds: Double, provider: TranscriptionProvider, sessionDir: URL,
          inputDevicePrefs: [String] = []) {
+        self.chunkSeconds = chunkSeconds
         self.chunkSamples = max(1, Int(chunkSeconds * 16000))
         self.provider = provider
         self.sessionDir = sessionDir
         self.inputDevicePrefs = inputDevicePrefs
+        let work = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SolarCopilot", isDirectory: true)
+        try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        self.workWavURL = work.appendingPathComponent(sessionDir.lastPathComponent + ".wav")
+    }
+
+    // MARK: - Лог (файл — апп не пишет в unified log, при отвале были слепы)
+
+    static let logURL: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/solar-copilot.log")
+    private static let logQueue = DispatchQueue(label: "com.solar.copilot.log")
+    static func log(_ s: String) {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "[\(f.string(from: Date()))] \(s)\n"
+        logQueue.async {
+            guard let data = line.data(using: .utf8) else { return }
+            if let h = try? FileHandle(forWritingTo: logURL) {
+                defer { try? h.close() }
+                _ = try? h.seekToEnd()
+                try? h.write(contentsOf: data)
+            } else {
+                try? data.write(to: logURL)
+            }
+        }
     }
 
     private var deviceOverridden = false
@@ -79,13 +150,12 @@ final class AudioRecorder {
         }
         guard inputFormat.sampleRate > 0 else {
             onError?("Микрофон недоступен (нулевой формат входа).")
+            Self.log("✗ старт: формат входа 0 — микрофон недоступен")
             return
         }
         converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
-        try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
-        let wavURL = sessionDir.appendingPathComponent("audio.wav")
-        fileWriter = WAVFileWriter(url: wavURL, sampleRate: 16000)
+        fileWriter = WAVFileWriter(url: workWavURL, sampleRate: 16000)
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             self?.process(buffer)
@@ -94,6 +164,9 @@ final class AudioRecorder {
             engine.prepare()
             try engine.start()
             running = true
+            installConfigObserver()
+            startWatchdog()
+            Self.log("✓ запись началась, вход \(Int(inputFormat.sampleRate))Hz, wav=\(workWavURL.lastPathComponent)")
         } catch {
             // Если падали с переопределённым устройством (RecordCall) — один чистый
             // ретрай на системном mic: снимаем tap, сбрасываем девайс, переинициализируем.
@@ -106,35 +179,150 @@ final class AudioRecorder {
                     input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { [weak self] buffer, _ in
                         self?.process(buffer)
                     }
-                    do { engine.prepare(); try engine.start(); running = true; return }
-                    catch { /* проваливаемся в общий onError ниже */ }
+                    do {
+                        engine.prepare(); try engine.start(); running = true
+                        installConfigObserver(); startWatchdog()
+                        Self.log("✓ запись началась (ретрай на системном mic), вход \(Int(fmt.sampleRate))Hz")
+                        return
+                    } catch { /* проваливаемся в общий onError ниже */ }
                 }
             }
             onError?("Не удалось запустить аудио: \(error.localizedDescription)")
+            Self.log("✗ старт не удался: \(error.localizedDescription)")
         }
     }
 
     func stop() {
         guard running else { return }
+        running = false
+        removeConfigObserver()
+        watchdog?.invalidate(); watchdog = nil
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        running = false
         flush(final: true)
-        // writer и onSaved захватываем СТРОГО (не через self) — иначе при немедленном
-        // освобождении recorder в AppDelegate финализация/конвертация не выполнится
-        // (был баг: заголовок WAV оставался с нулевым размером → файл «не открывается»).
+        // writer/onSaved/пути захватываем СТРОГО (не через self) — иначе при немедленном
+        // освобождении recorder в AppDelegate финализация/конвертация не выполнится.
         let writer = fileWriter
         fileWriter = nil
         let saved = onSaved
+        let sessionDir = self.sessionDir
+        let workWav = self.workWavURL
         ioQueue.async {
             guard let writer = writer else { return }
             writer.finalize()
-            let wavURL = writer.url
-            let m4aURL = wavURL.deletingPathExtension().appendingPathExtension("m4a")
-            let okM4A = AudioRecorder.convertToM4A(wav: wavURL, m4a: m4aURL)
-            let finalURL = okM4A ? m4aURL : wavURL
-            if okM4A { try? FileManager.default.removeItem(at: wavURL) }
+            try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+            let localM4A = workWav.deletingPathExtension().appendingPathExtension("m4a")
+            let finalURL: URL
+            if AudioRecorder.convertToM4A(wav: workWav, m4a: localM4A) {
+                let dest = sessionDir.appendingPathComponent("audio.m4a")
+                try? FileManager.default.removeItem(at: dest)
+                do {
+                    // Один файл целиком (не непрерывная запись) — iCloud это проглатывает.
+                    try FileManager.default.copyItem(at: localM4A, to: dest)
+                    try? FileManager.default.removeItem(at: localM4A)
+                    try? FileManager.default.removeItem(at: workWav)
+                    finalURL = dest
+                } catch {
+                    Self.log("⚠️ копия m4a в архив не удалась (\(error.localizedDescription)) — оставил локально")
+                    finalURL = localM4A
+                }
+            } else {
+                // Не сконвертили — кладём wav в архив, чтобы не потерять запись.
+                let dest = sessionDir.appendingPathComponent("audio.wav")
+                try? FileManager.default.removeItem(at: dest)
+                if (try? FileManager.default.copyItem(at: workWav, to: dest)) != nil {
+                    try? FileManager.default.removeItem(at: workWav)
+                    finalURL = dest
+                } else {
+                    finalURL = workWav
+                }
+                Self.log("⚠️ конвертация в m4a не удалась, сохранил wav")
+            }
+            Self.log("✓ запись сохранена: \(finalURL.path)")
             DispatchQueue.main.async { saved?(finalURL) }
+        }
+    }
+
+    // MARK: - Перезапуск движка при смене аудиоустройства
+
+    /// AVAudioEngine штатно ОСТАНАВЛИВАЕТСЯ при смене аудиоконфигурации (новое устройство,
+    /// смена sample rate, захват микрофона созвоном). Без перезапуска запись «отваливается».
+    private func installConfigObserver() {
+        guard configObserver == nil else { return }
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in self?.handleConfigChange() }
+    }
+
+    private func removeConfigObserver() {
+        if let o = configObserver { NotificationCenter.default.removeObserver(o); configObserver = nil }
+    }
+
+    private func handleConfigChange() {
+        guard running, !restarting else { return }
+        Self.log("⚠️ AVAudioEngineConfigurationChange — аудиомаршрут сменился, перезапуск движка")
+        onNotice?("🔄 Сменилось аудиоустройство — переподключаю запись")
+        restartEngine()
+    }
+
+    /// Снять старый tap, перечитать формат входа (он мог измениться!), пересоздать
+    /// converter под новый формат, поставить tap, запустить движок.
+    private func restartEngine() {
+        guard running, !restarting else { return }
+        restarting = true
+        defer { restarting = false }
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        if engine.isRunning { engine.stop() }
+        let fmt = input.inputFormat(forBus: 0)
+        guard fmt.sampleRate > 0 else {
+            Self.log("restart: формат входа 0 — устройство ещё не готово, ретрай через 1.5с")
+            scheduleRestartRetry()
+            return
+        }
+        converter = AVAudioConverter(from: fmt, to: targetFormat)
+        input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { [weak self] buffer, _ in
+            self?.process(buffer)
+        }
+        do {
+            engine.prepare()
+            try engine.start()
+            lock.lock(); watchdogPrev = bufferTotal; lock.unlock()   // не дать watchdog сработать сразу
+            Self.log("✓ движок перезапущен, вход \(Int(fmt.sampleRate))Hz")
+        } catch {
+            Self.log("✗ перезапуск не удался: \(error.localizedDescription) — ретрай через 1.5с")
+            scheduleRestartRetry()
+        }
+    }
+
+    private func scheduleRestartRetry() {
+        guard running else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self, self.running, !self.engine.isRunning else { return }
+            self.restartEngine()
+        }
+    }
+
+    // MARK: - Watchdog (страховка, если config-change нотификация не пришла)
+
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        lock.lock(); watchdogPrev = bufferTotal; lock.unlock()
+        let interval = max(6.0, chunkSeconds * 0.5)
+        let t = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.watchdogTick()
+        }
+        watchdog = t
+    }
+
+    private func watchdogTick() {
+        guard running, !restarting else { return }
+        lock.lock(); let total = bufferTotal; let prev = watchdogPrev; watchdogPrev = bufferTotal; lock.unlock()
+        if total == prev {
+            // ни одного аудио-буфера за интервал при активной записи → движок завис/встал
+            Self.log("watchdog: 0 новых буферов (engine.isRunning=\(engine.isRunning)) — перезапуск движка")
+            onNotice?("🔄 Запись подвисла — переподключаю микрофон")
+            restartEngine()
         }
     }
 
@@ -161,8 +349,9 @@ final class AudioRecorder {
         let writer = fileWriter
         ioQueue.async { writer?.append(samples) }
 
-        // (2) накопление для whisper
+        // (2) накопление для whisper + счётчик буферов для watchdog
         lock.lock()
+        bufferTotal += 1
         sampleBuffer.append(contentsOf: samples)
         let ready = sampleBuffer.count >= chunkSamples
         lock.unlock()
@@ -179,18 +368,8 @@ final class AudioRecorder {
         lock.unlock()
 
         let wav = AudioRecorder.wavData(samples: chunk, sampleRate: 16000)
-        Task { [weak self] in
-            guard let self = self else { return }
-            do {
-                let text = try await self.provider.transcribe(wav: wav)
-                let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !clean.isEmpty {
-                    await MainActor.run { self.onTranscript?(clean) }
-                }
-            } catch {
-                await MainActor.run { self.onError?("Whisper: \(error.localizedDescription)") }
-            }
-        }
+        let pipeline = transcriptionPipeline
+        Task { await pipeline.enqueue(wav) }
     }
 
     /// Конвертация WAV → M4A (AAC) встроенным macOS `afconvert`.

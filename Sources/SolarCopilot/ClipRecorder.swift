@@ -2,9 +2,12 @@ import Foundation
 import AVFoundation
 
 /// Лёгкий рекордер короткого клипа для диктовки (Phase 5): системный mic →
-/// 16kHz mono Int16 → wav в /tmp. Быстрый старт (AVAudioEngine ~десятки мс,
-/// в отличие от ffmpeg avfoundation ~2с). Без whisper-стрима — просто файл,
-/// который потом скармливается `dictate-pipeline`.
+/// 16kHz mono Int16 → wav в /tmp. Старт синхронный на main (так AVAudioEngine
+/// надёжно отдаёт буферы; конфигурация движка с фонового потока их теряет —
+/// проверено: фоновый старт давал пустые wav). На Bluetooth первый холодный старт
+/// `engine.start()` может занять ~1-2с (HFP) — звук Tink звучит, КОГДА движок реально
+/// готов = сигнал «говори». Тап-vs-удержание считается по таймстампу события клавиши,
+/// поэтому эта задержка не ломает детект (см. DictationController).
 final class ClipRecorder {
     private let engine = AVAudioEngine()
     private var converter: AVAudioConverter?
@@ -17,7 +20,7 @@ final class ClipRecorder {
 
     var isRecording: Bool { running }
 
-    /// true если запись стартовала.
+    /// true если запись стартовала. Синхронно на вызывающем потоке (main).
     @discardableResult
     func start() -> Bool {
         guard !running else { return false }
@@ -40,6 +43,8 @@ final class ClipRecorder {
             running = true
             return true
         } catch {
+            input.removeTap(onBus: 0)
+            writer = nil; url = nil
             return false
         }
     }

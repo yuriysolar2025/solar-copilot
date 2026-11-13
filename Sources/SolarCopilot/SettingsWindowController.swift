@@ -10,6 +10,7 @@ final class SettingsWindowController {
     private var chunkField: NSTextField?
     private var langField: NSTextField?
     private var intervalField: NSTextField?
+    private var providerPopup: NSPopUpButton?
     private var assistantCheck: NSButton?
     private var sendCheck: NSButton?
 
@@ -22,7 +23,7 @@ final class SettingsWindowController {
     }
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 360),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 400),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "\(L.appName) — Настройки"
         w.isReleasedWhenClosed = false
@@ -35,15 +36,20 @@ final class SettingsWindowController {
             v.addSubview(l)
         }
 
-        label("Папка записей:", 308)
-        let pf = NSTextField(frame: NSRect(x: 176, y: 306, width: 190, height: 24))
+        label("Папка записей:", 348)
+        let pf = NSTextField(frame: NSRect(x: 176, y: 346, width: 190, height: 24))
         pf.isEditable = false
         pf.lineBreakMode = .byTruncatingMiddle
         v.addSubview(pf); pathField = pf
-        let choose = NSButton(frame: NSRect(x: 372, y: 304, width: 82, height: 28))
+        let choose = NSButton(frame: NSRect(x: 372, y: 344, width: 82, height: 28))
         choose.title = "Выбрать…"; choose.bezelStyle = .rounded
         choose.target = self; choose.action = #selector(chooseFolder)
         v.addSubview(choose)
+
+        label("AI движок:", 308)
+        let provider = NSPopUpButton(frame: NSRect(x: 176, y: 304, width: 278, height: 30))
+        provider.addItems(withTitles: [LLMProviderMode.auto.title, LLMProviderMode.claude.title, LLMProviderMode.codex.title])
+        v.addSubview(provider); providerPopup = provider
 
         label("Whisper URL:", 268)
         let wf = NSTextField(frame: NSRect(x: 176, y: 266, width: 278, height: 24))
@@ -69,6 +75,7 @@ final class SettingsWindowController {
         let sc = NSButton(checkboxWithTitle: "Отправлять записи в ассистента (Telegram)",
                           target: self, action: nil)
         sc.frame = NSRect(x: 176, y: 82, width: 290, height: 22)
+        sc.isHidden = AppConfig.load().publicMode   // маршрут в Telegram есть только у владельца
         v.addSubview(sc); sendCheck = sc
 
         let save = NSButton(frame: NSRect(x: 350, y: 18, width: 104, height: 32))
@@ -91,6 +98,13 @@ final class SettingsWindowController {
         chunkField?.stringValue = String(Int(c.chunkSeconds))
         langField?.stringValue = c.language
         intervalField?.stringValue = String(Int(c.suggestionIntervalSec))
+        let providerIndex: Int
+        switch c.llmProviderMode {
+        case .auto: providerIndex = 0
+        case .claude: providerIndex = 1
+        case .codex: providerIndex = 2
+        }
+        providerPopup?.selectItem(at: providerIndex)
         assistantCheck?.state = c.assistantEnabled ? .on : .off
         sendCheck?.state = c.sendToAssistant ? .on : .off
     }
@@ -114,6 +128,13 @@ final class SettingsWindowController {
         if let cs = chunkField?.stringValue, let n = Double(cs), n > 0 { d.set(n, forKey: "chunkSeconds") }
         if let lg = langField?.stringValue, !lg.isEmpty { d.set(lg, forKey: "language") }
         if let iv = intervalField?.stringValue, let n = Double(iv), n > 0 { d.set(n, forKey: "suggestionIntervalSec") }
+        let provider: LLMProviderMode
+        switch providerPopup?.indexOfSelectedItem ?? 0 {
+        case 1: provider = .claude
+        case 2: provider = .codex
+        default: provider = .auto
+        }
+        d.set(provider.rawValue, forKey: "llmProviderMode")
         d.set(assistantCheck?.state == .on, forKey: "assistantEnabled")
         d.set(sendCheck?.state == .on, forKey: "sendToAssistant")
         closeWin()
